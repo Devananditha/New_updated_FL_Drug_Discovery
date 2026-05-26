@@ -39,7 +39,14 @@ DRUG_IDS = [
 
 
 def find_pid_by_port(port: int) -> int | None:
-    """Return the PID of the process listening on a local TCP port."""
+    """Return the PID of the process listening on a local TCP port.
+
+    Args:
+        port: Local TCP port number.
+
+    Returns:
+        Process ID if a listener is found, otherwise ``None``.
+    """
     for connection in psutil.net_connections(kind="inet"):
         if not connection.laddr or connection.status != psutil.CONN_LISTEN:
             continue
@@ -51,7 +58,15 @@ def find_pid_by_port(port: int) -> int | None:
 
 
 async def wait_for_port(port: int, timeout: float = 8.0) -> bool:
-    """Wait until a restarted client is listening on the expected port."""
+    """Wait until a restarted client is listening on the expected port.
+
+    Args:
+        port: Local TCP port number to monitor.
+        timeout: Maximum seconds to wait for the listener.
+
+    Returns:
+        True if the port becomes active before the timeout expires.
+    """
     deadline = time.perf_counter() + timeout
 
     while time.perf_counter() < deadline:
@@ -63,7 +78,15 @@ async def wait_for_port(port: int, timeout: float = 8.0) -> bool:
 
 
 async def inject_fault(port: int = 8002, downtime_seconds: float = CLIENT_DOWNTIME_SECONDS) -> None:
-    """Kill and restart the client listening on the given port."""
+    """Kill and restart the client listening on the given port.
+
+    Args:
+        port: Local TCP port of the client to fault-inject.
+        downtime_seconds: Seconds to keep the client offline before restart.
+
+    Returns:
+        None
+    """
     pid = find_pid_by_port(port)
 
     if pid is None:
@@ -107,7 +130,15 @@ async def inject_fault(port: int = 8002, downtime_seconds: float = CLIENT_DOWNTI
 
 
 async def fetch_coordinator(session: aiohttp.ClientSession, drug_id: str) -> tuple[int, dict]:
-    """Send one retrieval query to the coordinator."""
+    """Send one retrieval query to the coordinator.
+
+    Args:
+        session: Shared asynchronous HTTP client session.
+        drug_id: Drug identifier to query.
+
+    Returns:
+        Tuple of HTTP status code and parsed JSON response body.
+    """
     async with session.get(COORDINATOR_URL, params={"drug_id": drug_id}, timeout=10) as response:
         payload = await response.json()
         return response.status, payload
@@ -118,7 +149,16 @@ async def run_load_test(
     fault_rate: float = 0.30,
     downtime_seconds: float = CLIENT_DOWNTIME_SECONDS,
 ) -> None:
-    """Run 100 coordinator queries while randomly killing and restarting Client 2."""
+    """Run coordinator queries while randomly killing and restarting Client 2.
+
+    Args:
+        total_queries: Number of federated queries to send.
+        fault_rate: Probability of injecting a Client 2 failure per query.
+        downtime_seconds: Seconds to keep Client 2 offline during fault injection.
+
+    Returns:
+        None
+    """
     full_answers = 0
     degraded_answers = 0
     failed_queries = 0

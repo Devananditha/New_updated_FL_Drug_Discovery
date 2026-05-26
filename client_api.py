@@ -14,8 +14,16 @@ CLIENT_NAME = "Unknown"
 
 
 @app.get("/retrieve")
-def retrieve(drug_id: str):
-    """Return local graph neighbors for a queried drug ID."""
+def retrieve(drug_id: str) -> dict:
+    """Return local graph neighbors for a queried drug ID.
+
+    Args:
+        drug_id: Drug or compound identifier present in the local graph partition.
+
+    Returns:
+        JSON payload with client metadata, matched targets, status, and a unique
+        ``update_id`` used by the coordinator for exactly-once ledger tracking.
+    """
     if G is None:
         raise HTTPException(status_code=503, detail="Client graph is not loaded")
 

@@ -26,7 +26,19 @@ CLIENT_URLS = [
 ]
 
 
-async def fetch_client_data(client, url, drug_id, timeout=2.0):
+async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float = 2.0) -> dict:
+    """Fetch drug-target evidence from one lab client with a strict timeout.
+
+    Args:
+        client: Logical client identifier (for example, ``Client_1``).
+        url: Base URL of the client service.
+        drug_id: Drug identifier to query.
+        timeout: Maximum seconds to wait for the client response.
+
+    Returns:
+        Parsed JSON response from the client, or a synthetic failure payload when
+        the client is unreachable or exceeds the timeout.
+    """
     target_url = f"{url}/retrieve?drug_id={drug_id}"
 
     try:
@@ -44,7 +56,20 @@ async def fetch_client_data(client, url, drug_id, timeout=2.0):
 
 
 @app.get("/global_retrieve")
-async def global_retrieve(drug_id: str):
+async def global_retrieve(drug_id: str) -> dict:
+    """Query all lab clients in parallel and return a partial federated answer.
+
+    The coordinator aggregates evidence from available clients, records ledger
+    events for exactly-once recovery, and reports completeness when some clients
+    fail or time out.
+
+    Args:
+        drug_id: Drug identifier shared across all client queries.
+
+    Returns:
+        Federated retrieval payload containing query metadata, completeness score,
+        available and missing clients, evidence paths, and raw client responses.
+    """
     query_id = str(uuid.uuid4())
 
     tasks = [

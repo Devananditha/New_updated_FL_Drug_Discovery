@@ -10,7 +10,13 @@ DUPLICATE_IGNORED = 2
 
 
 def create_reliability_chart() -> None:
-    """Create a pie chart for full vs degraded federated retrieval answers."""
+    """Create a pie chart for full vs degraded federated retrieval answers.
+
+    Saves the chart to ``reliability_chart.png`` at 300 DPI.
+
+    Returns:
+        None
+    """
     labels = ["Full Answers (3/3)", "Degraded Answers (<3/3)"]
     values = [FULL_ANSWERS, DEGRADED_ANSWERS]
     colors = ["#2E7D32", "#F9A825"]
@@ -46,7 +52,13 @@ def create_reliability_chart() -> None:
 
 
 def create_recovery_chart() -> None:
-    """Create a bar chart for committed updates vs ignored duplicates."""
+    """Create a bar chart for committed updates vs ignored duplicates.
+
+    Saves the chart to ``recovery_chart.png`` at 300 DPI.
+
+    Returns:
+        None
+    """
     labels = ["Update Committed", "Duplicate Ignored"]
     values = [UPDATE_COMMITTED, DUPLICATE_IGNORED]
     colors = ["#1565C0", "#C62828"]

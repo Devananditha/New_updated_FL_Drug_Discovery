@@ -8,12 +8,29 @@ _DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "ledger" / "ledger.db"
 
 
 def _resolve_db_path(db_path: str) -> str:
+    """Resolve a database path relative to the project ledger directory.
+
+    Args:
+        db_path: Caller-provided database path or the shorthand ``ledger.db``.
+
+    Returns:
+        Absolute filesystem path to the SQLite database file.
+    """
     if db_path == "ledger.db":
         return str(_DEFAULT_DB_PATH)
     return db_path
 
 
 def check_if_duplicate(update_id: str, db_path: str = "ledger.db") -> bool:
+    """Check whether an update has already been committed to the ledger.
+
+    Args:
+        update_id: Unique client response identifier.
+        db_path: SQLite database path or ``ledger.db`` shorthand.
+
+    Returns:
+        True if a committed row with the same ``update_id`` already exists.
+    """
     resolved_path = _resolve_db_path(db_path)
 
     with sqlite3.connect(resolved_path, timeout=30.0) as conn:
@@ -38,12 +55,26 @@ def log_to_ledger(
     status: str,
     db_path: str = "ledger.db",
 ) -> None:
+    """Append a checkpoint event to the SQLite ledger.
+
+    Duplicate replay events are stored as separate audit rows so the original
+    committed update remains immutable.
+
+    Args:
+        query_id: Federated query identifier assigned by the coordinator.
+        client_id: Responding client identifier.
+        update_id: Unique client update or response identifier.
+        status: Ledger status such as ``update_committed`` or ``duplicate_ignored``.
+        db_path: SQLite database path or ``ledger.db`` shorthand.
+
+    Returns:
+        None
+    """
     resolved_path = _resolve_db_path(db_path)
     timestamp = datetime.now().isoformat()
     ledger_update_id = update_id
 
     if status == "duplicate_ignored":
-        # Keep the original committed update immutable and append a separate audit event.
         ledger_update_id = f"{update_id}::duplicate_ignored::{query_id}"
 
     with sqlite3.connect(resolved_path, timeout=30.0) as conn:
