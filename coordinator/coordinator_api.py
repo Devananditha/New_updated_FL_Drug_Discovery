@@ -1,10 +1,19 @@
 """Central coordinator for federated drug-target graph retrieval."""
 
 import asyncio
+import sys
+import uuid
+from pathlib import Path
 
 import httpx
 import uvicorn
 from fastapi import FastAPI
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from ledger.ledger_manager import log_update
 
 app = FastAPI()
 
@@ -36,11 +45,22 @@ async def fetch_client_data(client, url, drug_id, timeout=2.0):
 @app.get("/global_retrieve")
 async def global_retrieve(drug_id: str):
     """Query all lab clients in parallel and aggregate successful targets."""
+    query_id = str(uuid.uuid4())
+
     tasks = [
         fetch_client_data(f"Client_{index}", url, drug_id)
         for index, url in enumerate(CLIENT_URLS, start=1)
     ]
     raw_responses = await asyncio.gather(*tasks)
+
+    for response in raw_responses:
+        update_id = f"{query_id}_{response['client_id']}"
+        log_update(
+            update_id=update_id,
+            query_id=query_id,
+            client_id=response["client_id"],
+            status=response["status"],
+        )
 
     available_clients = []
     missing_clients = []
@@ -64,6 +84,7 @@ async def global_retrieve(drug_id: str):
 
     return {
         "query": drug_id,
+        "query_id": query_id,
         "completeness_score": completeness_score,
         "available_clients": available_clients,
         "missing_clients": missing_clients,
