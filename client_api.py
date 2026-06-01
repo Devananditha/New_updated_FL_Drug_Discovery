@@ -1,6 +1,7 @@
 """Reusable FastAPI client for local drug-target graph retrieval."""
 
 import argparse
+import hashlib
 import uuid
 
 import networkx as nx
@@ -35,6 +36,12 @@ def state_dict_to_lists(state_dict: dict) -> dict:
     return {key: tensor.detach().cpu().tolist() for key, tensor in state_dict.items()}
 
 
+def compute_batch_hash(targets: list) -> str:
+    """Build an SHA-256 digest over batched targets (rollup-style integrity root)."""
+    targets_string = ",".join(str(target) for target in targets)
+    return hashlib.sha256(targets_string.encode("utf-8")).hexdigest()
+
+
 def train_local_model(drug_id: str) -> dict:
     """Run a dummy 1-epoch local training loop and return serializable weights."""
     seed = abs(hash(drug_id)) % (2**32)
@@ -66,12 +73,14 @@ def retrieve(drug_id: str) -> dict:
     model_weights = train_local_model(drug_id)
 
     if drug_id not in G:
+        targets: list = []
         payload = {
             "client_id": CLIENT_NAME,
             "drug_id": drug_id,
-            "targets": [],
+            "targets": targets,
             "status": "not_found",
             "model_weights": model_weights,
+            "batch_hash": compute_batch_hash(targets),
         }
         payload["update_id"] = str(uuid.uuid4())
         return payload
@@ -83,6 +92,7 @@ def retrieve(drug_id: str) -> dict:
         "targets": targets,
         "status": "success",
         "model_weights": model_weights,
+        "batch_hash": compute_batch_hash(targets),
     }
     payload["update_id"] = str(uuid.uuid4())
     return payload

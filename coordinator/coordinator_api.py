@@ -28,6 +28,34 @@ CLIENT_URLS = [
     "http://localhost:8003",
 ]
 
+UNBATCHED_GAS_PER_TARGET = 10
+BATCHED_GAS_PER_CLIENT = 50
+
+
+def calculate_gas_optimization_metrics(
+    all_targets_found: list,
+    successful_clients_count: int,
+    verified_batch_hashes: list[str],
+) -> dict:
+    """Estimate theoretical gas savings from batching vs per-target transactions."""
+    simulated_unbatched_gas = len(all_targets_found) * UNBATCHED_GAS_PER_TARGET
+    actual_batched_gas = successful_clients_count * BATCHED_GAS_PER_CLIENT
+
+    if simulated_unbatched_gas == 0:
+        gas_saved_percentage = 0.0
+    else:
+        gas_saved_percentage = round(
+            ((simulated_unbatched_gas - actual_batched_gas) / simulated_unbatched_gas) * 100,
+            2,
+        )
+
+    return {
+        "simulated_unbatched_gas": simulated_unbatched_gas,
+        "actual_batched_gas": actual_batched_gas,
+        "gas_saved_percentage": gas_saved_percentage,
+        "verified_batch_hashes": verified_batch_hashes,
+    }
+
 
 def aggregate_models(client_weights_list: list[dict]) -> dict:
     """Average client model weights using the FedAvg algorithm."""
@@ -112,6 +140,9 @@ async def global_retrieve(drug_id: str) -> dict:
 
     evidence_paths = []
     client_weights_list = []
+    all_targets_found = []
+    verified_batch_hashes = []
+    successful_clients_count = 0
     for response in raw_responses:
         update_id = response.get("update_id")
         client_id = response.get("client_id", "unknown")
@@ -154,16 +185,29 @@ async def global_retrieve(drug_id: str) -> dict:
         )
 
         if response.get("status") == "success":
+            successful_clients_count += 1
+            targets = response.get("targets", [])
+            all_targets_found.extend(targets)
+
+            batch_hash = response.get("batch_hash")
+            if batch_hash:
+                verified_batch_hashes.append(batch_hash)
+
             model_weights = response.get("model_weights")
             if model_weights:
                 client_weights_list.append(model_weights)
 
-            for target in response.get("targets", []):
+            for target in targets:
                 evidence_paths.append(
                     {"client_id": client_id, "path": f"{drug_id} -> {target}"}
                 )
 
     global_aggregated_model = aggregate_models(client_weights_list)
+    gas_optimization_metrics = calculate_gas_optimization_metrics(
+        all_targets_found,
+        successful_clients_count,
+        verified_batch_hashes,
+    )
 
     return {
         "query": drug_id,
@@ -174,6 +218,7 @@ async def global_retrieve(drug_id: str) -> dict:
         "evidence_paths_count": len(evidence_paths),
         "evidence_paths": evidence_paths,
         "global_aggregated_model": global_aggregated_model,
+        "gas_optimization_metrics": gas_optimization_metrics,
         "raw_responses": raw_responses,
     }
 
