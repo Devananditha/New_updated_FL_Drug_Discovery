@@ -233,6 +233,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
     client_weights_list = []
     all_targets_found = []
     verified_batch_hashes = []
+    client_confidences = []
     successful_clients_count = 0
     for response in raw_responses:
         update_id = response.get("update_id")
@@ -297,6 +298,9 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
             **ledger_fields,
         )
 
+        if response.get("status") in ("success", "not_found"):
+            client_confidences.append(float(response.get("local_confidence", 0.0)))
+
         if response.get("status") == "success":
             successful_clients_count += 1
             targets = response.get("targets", [])
@@ -314,6 +318,11 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
                     {"client_id": client_id, "path": f"{drug_id} -> {target}"}
                 )
 
+    global_confidence = (
+        round(sum(client_confidences) / len(client_confidences), 2)
+        if client_confidences
+        else 0.0
+    )
     global_aggregated_model = aggregate_models(client_weights_list)
     gas_optimization_metrics = calculate_gas_optimization_metrics(
         all_targets_found,
@@ -326,6 +335,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         "query_id": query_id,
         "round_id": round_id,
         "completeness_score": completeness_score,
+        "retrieval_confidence_score": f"{int(global_confidence * 100)}%",
         "available_clients": available_clients,
         "missing_clients": missing_clients,
         "evidence_paths_count": len(evidence_paths),

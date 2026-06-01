@@ -70,6 +70,14 @@ def compute_batch_hash(targets: list) -> str:
     return hashlib.sha256(targets_string.encode("utf-8")).hexdigest()
 
 
+def calculate_local_confidence(evidence_paths_count: int) -> float:
+    """Estimate local retrieval confidence from the amount of graph evidence."""
+    if evidence_paths_count == 0:
+        return 0.0
+
+    return round(min(0.99, 0.50 + (evidence_paths_count * 0.005)), 2)
+
+
 def train_local_model(drug_id: str) -> dict:
     """Run a dummy 1-epoch local training loop and return serializable weights."""
     seed = abs(hash(drug_id)) % (2**32)
@@ -145,6 +153,7 @@ def retrieve(drug_id: str) -> dict:
     if drug_id not in G:
         targets: list = []
         response_id = str(uuid.uuid4())
+        local_confidence = calculate_local_confidence(len(targets))
         payload = {
             "client_id": CLIENT_NAME,
             "drug_id": drug_id,
@@ -152,6 +161,7 @@ def retrieve(drug_id: str) -> dict:
             "status": "not_found",
             "model_weights": model_weights,
             "batch_hash": compute_batch_hash(targets),
+            "local_confidence": local_confidence,
             "response_id": response_id,
             "checkpoint_path": client_checkpoint_path(),
             "model_version": MODEL_VERSION,
@@ -161,6 +171,7 @@ def retrieve(drug_id: str) -> dict:
 
     targets = list(G.neighbors(drug_id))
     response_id = str(uuid.uuid4())
+    local_confidence = calculate_local_confidence(len(targets))
     payload = {
         "client_id": CLIENT_NAME,
         "drug_id": drug_id,
@@ -168,6 +179,7 @@ def retrieve(drug_id: str) -> dict:
         "status": "success",
         "model_weights": model_weights,
         "batch_hash": compute_batch_hash(targets),
+        "local_confidence": local_confidence,
         "response_id": response_id,
         "checkpoint_path": client_checkpoint_path(),
         "model_version": MODEL_VERSION,
