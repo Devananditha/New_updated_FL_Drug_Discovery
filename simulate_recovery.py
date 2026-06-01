@@ -96,7 +96,7 @@ def main():
     }
 
     print("=" * 60)
-    print("June 12 Recovery Simulation")
+    print("Recovery Simulation")
     print("=" * 60)
     print(f"\n[1] Loaded committed update_id from ledger:\n    {update_id}")
     print(f"\n[2] Crafted stale Client_1 payload (restart replay):")
