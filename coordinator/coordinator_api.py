@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,7 +104,7 @@ async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float 
 
 
 @app.get("/global_retrieve")
-async def global_retrieve(drug_id: str) -> dict:
+async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
     """Query all lab clients in parallel and return a partial federated answer.
 
     The coordinator aggregates evidence from available clients, records ledger
@@ -135,6 +135,12 @@ async def global_retrieve(drug_id: str) -> dict:
             available_clients.append(client_id)
         elif status == "failed_or_timeout":
             missing_clients.append(client_id)
+
+    if mode == "unaware" and len(missing_clients) > 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Federated query stalled: Missing required client nodes: {missing_clients}",
+        )
 
     completeness_score = f"{len(available_clients)}/{len(CLIENT_URLS)}"
 
