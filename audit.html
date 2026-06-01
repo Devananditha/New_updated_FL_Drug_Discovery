@@ -33,6 +33,41 @@
       font-size: 0.8rem;
       letter-spacing: 0.02em;
     }
+    tr.row-query-started {
+      background-color: #e8eef4;
+    }
+    tr.row-query-started td {
+      color: #495057;
+      font-weight: 500;
+    }
+    tr.row-client-recovered {
+      background: linear-gradient(90deg, #e8f4fd 0%, #f3e8ff 100%);
+      border-left: 4px solid #6f42c1;
+    }
+    tr.row-client-timeout {
+      background-color: #fff5f5;
+    }
+    .badge-query-started {
+      background-color: #adb5bd !important;
+      color: #212529 !important;
+    }
+    .badge-client-responded {
+      background-color: #cfe2ff !important;
+      color: #084298 !important;
+    }
+    .badge-update-uploaded {
+      background-color: #cff4fc !important;
+      color: #055160 !important;
+    }
+    .badge-client-timeout {
+      background-color: #f8d7da !important;
+      color: #842029 !important;
+    }
+    .badge-client-recovered {
+      background-color: #6f42c1 !important;
+      color: #fff !important;
+      box-shadow: 0 0 0 2px rgba(111, 66, 193, 0.25);
+    }
   </style>
 </head>
 <body>
@@ -77,8 +112,22 @@
     function statusBadgeClass(status) {
       if (status === "update_committed") return "bg-success";
       if (status === "duplicate_ignored") return "bg-warning text-dark";
-      if (status === "query_started") return "bg-primary";
+      if (status === "query_started") return "badge-query-started";
+      if (status === "client_responded") return "badge-client-responded";
+      if (status === "update_uploaded") return "badge-update-uploaded";
+      if (status === "client_timeout") return "badge-client-timeout";
+      if (status === "client_recovered") return "badge-client-recovered";
+      if (status === "failed_or_timeout") return "badge-client-timeout";
       return "bg-secondary";
+    }
+
+    function statusRowClass(status) {
+      if (status === "query_started") return "row-query-started";
+      if (status === "client_recovered") return "row-client-recovered";
+      if (status === "client_timeout" || status === "failed_or_timeout") {
+        return "row-client-timeout";
+      }
+      return "";
     }
 
     function truncate(value, maxLength) {
@@ -102,8 +151,9 @@
       tbody.innerHTML = rows
         .map((row) => {
           const badgeClass = statusBadgeClass(row.status);
+          const rowClass = statusRowClass(row.status);
           return `
-            <tr>
+            <tr class="${rowClass}">
               <td>${row.timestamp || ""}</td>
               <td class="mono" title="${row.query_id || ""}">${truncate(row.query_id, 20)}</td>
               <td>${row.client_id || ""}</td>
@@ -131,7 +181,7 @@
         renderRows(rows);
       } catch (error) {
         tbody.innerHTML =
-          '<tr><td colspan="5" class="text-center text-danger py-4">Failed to load audit data.</td></tr>';
+          '<tr><td colspan="7" class="text-center text-danger py-4">Failed to load audit data.</td></tr>';
         document.getElementById("row-count").textContent = "Error: " + error.message;
       }
     }

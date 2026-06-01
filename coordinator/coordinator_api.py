@@ -17,6 +17,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from coordinator.coordinator_db import (
     DEFAULT_MODEL_VERSION,
+    LEDGER_EVENT_CLIENT_RECOVERED,
+    LEDGER_EVENT_CLIENT_RESPONDED,
+    LEDGER_EVENT_CLIENT_TIMEOUT,
+    LEDGER_EVENT_DUPLICATE_IGNORED,
+    LEDGER_EVENT_QUERY_STARTED,
+    LEDGER_EVENT_UPDATE_COMMITTED,
+    LEDGER_EVENT_UPDATE_UPLOADED,
+    SYSTEM_CLIENT_ID,
     check_if_duplicate,
     default_checkpoint_path,
     get_audit_trail,
@@ -51,6 +59,28 @@ def _next_round_id() -> int:
     return _FEDERATED_ROUND_ID
 
 
+async def _record_ledger_event(
+    query_id: str,
+    client_id: str,
+    ledger_update_id: str,
+    status: str,
+    round_id: int,
+    **ledger_fields,
+) -> None:
+    """Append one taxonomy event to the checkpoint ledger on a worker thread."""
+    ledger_fields.pop("round_id", None)
+    await asyncio.to_thread(
+        log_to_ledger,
+        query_id,
+        client_id,
+        ledger_update_id,
+        status,
+        LEDGER_DB_PATH,
+        round_id=round_id,
+        **ledger_fields,
+    )
+
+
 def _ledger_fields_from_response(response: dict, round_id: int) -> dict:
     """Map a client or synthetic coordinator response to extended ledger columns."""
     client_id = response.get("client_id", "unknown")
@@ -59,7 +89,6 @@ def _ledger_fields_from_response(response: dict, round_id: int) -> dict:
     return {
         "request_id": response.get("request_id"),
         "response_id": response.get("response_id") or response.get("update_id"),
-        "round_id": response.get("round_id", round_id),
         "checkpoint_path": response.get("checkpoint_path") or default_checkpoint_path(client_id),
         "model_version": response.get("model_version", DEFAULT_MODEL_VERSION),
         "evidence_hash": batch_hash,
@@ -163,6 +192,19 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
     query_id = str(uuid.uuid4())
     round_id = _next_round_id()
 
+    await _record_ledger_event(
+        query_id,
+        SYSTEM_CLIENT_ID,
+        f"{query_id}::{LEDGER_EVENT_QUERY_STARTED}",
+        LEDGER_EVENT_QUERY_STARTED,
+        round_id,
+        request_id=str(uuid.uuid4()),
+        response_id="",
+        checkpoint_path="",
+        model_version=DEFAULT_MODEL_VERSION,
+        evidence_hash="",
+    )
+
     tasks = [
         fetch_client_data(f"Client_{index}", url, drug_id)
         for index, url in enumerate(CLIENT_URLS, start=1)
@@ -199,42 +241,59 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
 
         ledger_fields = _ledger_fields_from_response(response, round_id)
 
-        if not update_id:
-            timeout_update_id = f"{query_id}_{client_id}_{status}"
-            await asyncio.to_thread(
-                log_to_ledger,
+        if status == "failed_or_timeout" or not update_id:
+            timeout_ledger_id = f"{query_id}::{client_id}::{LEDGER_EVENT_CLIENT_TIMEOUT}"
+            await _record_ledger_event(
                 query_id,
                 client_id,
-                timeout_update_id,
-                status,
-                LEDGER_DB_PATH,
+                timeout_ledger_id,
+                LEDGER_EVENT_CLIENT_TIMEOUT,
+                round_id,
                 **ledger_fields,
             )
             continue
+
+        await _record_ledger_event(
+            query_id,
+            client_id,
+            f"{query_id}::{client_id}::{LEDGER_EVENT_CLIENT_RESPONDED}",
+            LEDGER_EVENT_CLIENT_RESPONDED,
+            round_id,
+            **ledger_fields,
+        )
 
         is_duplicate = await asyncio.to_thread(
             check_if_duplicate, update_id, LEDGER_DB_PATH
         )
 
         if is_duplicate:
-            await asyncio.to_thread(
-                log_to_ledger,
+            await _record_ledger_event(
                 query_id,
                 client_id,
                 update_id,
-                "duplicate_ignored",
-                LEDGER_DB_PATH,
+                LEDGER_EVENT_DUPLICATE_IGNORED,
+                round_id,
                 **ledger_fields,
             )
             continue
 
-        await asyncio.to_thread(
-            log_to_ledger,
+        model_weights = response.get("model_weights")
+        if model_weights:
+            await _record_ledger_event(
+                query_id,
+                client_id,
+                f"{query_id}::{client_id}::{LEDGER_EVENT_UPDATE_UPLOADED}::{update_id}",
+                LEDGER_EVENT_UPDATE_UPLOADED,
+                round_id,
+                **ledger_fields,
+            )
+
+        await _record_ledger_event(
             query_id,
             client_id,
             update_id,
-            "update_committed",
-            LEDGER_DB_PATH,
+            LEDGER_EVENT_UPDATE_COMMITTED,
+            round_id,
             **ledger_fields,
         )
 
@@ -247,7 +306,6 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
             if batch_hash:
                 verified_batch_hashes.append(batch_hash)
 
-            model_weights = response.get("model_weights")
             if model_weights:
                 client_weights_list.append(model_weights)
 
@@ -296,6 +354,25 @@ async def client_checkpoint(client_name: str) -> dict:
     if checkpoint is None:
         return {"status": "clean", "last_update_id": None}
 
+    recovery_query_id = checkpoint.get("query_id") or str(uuid.uuid4())
+    recovery_round_id = checkpoint.get("round_id") or 1
+    recovery_fields = {
+        "request_id": str(uuid.uuid4()),
+        "response_id": checkpoint["update_id"],
+        "checkpoint_path": checkpoint.get("checkpoint_path")
+        or default_checkpoint_path(client_name),
+        "model_version": checkpoint.get("model_version") or DEFAULT_MODEL_VERSION,
+        "evidence_hash": checkpoint.get("evidence_hash") or "",
+    }
+    await _record_ledger_event(
+        recovery_query_id,
+        client_name,
+        f"{client_name}::{LEDGER_EVENT_CLIENT_RECOVERED}::{uuid.uuid4()}",
+        LEDGER_EVENT_CLIENT_RECOVERED,
+        recovery_round_id,
+        **recovery_fields,
+    )
+
     return {
         "status": "found",
         "last_update_id": checkpoint["update_id"],
@@ -304,6 +381,7 @@ async def client_checkpoint(client_name: str) -> dict:
         "model_version": checkpoint.get("model_version"),
         "evidence_hash": checkpoint.get("evidence_hash"),
         "round_id": checkpoint.get("round_id"),
+        "ledger_event": LEDGER_EVENT_CLIENT_RECOVERED,
     }
 
 

@@ -9,6 +9,15 @@ _DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "ledger" / "ledger.db"
 
 DEFAULT_MODEL_VERSION = "v1.0.0"
 DEFAULT_ROUND_ID = 1
+SYSTEM_CLIENT_ID = "SYSTEM"
+
+LEDGER_EVENT_QUERY_STARTED = "query_started"
+LEDGER_EVENT_CLIENT_RESPONDED = "client_responded"
+LEDGER_EVENT_UPDATE_UPLOADED = "update_uploaded"
+LEDGER_EVENT_UPDATE_COMMITTED = "update_committed"
+LEDGER_EVENT_DUPLICATE_IGNORED = "duplicate_ignored"
+LEDGER_EVENT_CLIENT_TIMEOUT = "client_timeout"
+LEDGER_EVENT_CLIENT_RECOVERED = "client_recovered"
 
 _LEDGER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("request_id", "TEXT"),
@@ -36,6 +45,8 @@ def _resolve_db_path(db_path: str) -> str:
 
 def default_checkpoint_path(client_id: str) -> str:
     """Return the canonical on-disk checkpoint path for a federated client."""
+    if client_id == SYSTEM_CLIENT_ID:
+        return ""
     slug = client_id.strip().lower().replace(" ", "_")
     return f"checkpoints/{slug}.pt"
 
@@ -147,7 +158,10 @@ def log_to_ledger(
 
     resolved_request_id = request_id or str(uuid.uuid4())
     resolved_response_id = response_id or str(uuid.uuid4())
-    resolved_checkpoint_path = checkpoint_path or default_checkpoint_path(client_id)
+    if checkpoint_path is None:
+        resolved_checkpoint_path = default_checkpoint_path(client_id)
+    else:
+        resolved_checkpoint_path = checkpoint_path
     resolved_model_version = model_version or DEFAULT_MODEL_VERSION
     resolved_evidence_hash = evidence_hash or ""
 
@@ -227,6 +241,7 @@ def get_latest_client_checkpoint(client_name: str, db_path: str = "ledger.db") -
         cursor = conn.execute(
             """
             SELECT
+                query_id,
                 update_id,
                 timestamp,
                 checkpoint_path,
