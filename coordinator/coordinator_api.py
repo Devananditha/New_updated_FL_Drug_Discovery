@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import torch
 import uvicorn
 from fastapi import FastAPI
 
@@ -24,6 +25,23 @@ CLIENT_URLS = [
     "http://localhost:8002",
     "http://localhost:8003",
 ]
+
+
+def aggregate_models(client_weights_list: list[dict]) -> dict:
+    """Average client model weights using the FedAvg algorithm."""
+    if not client_weights_list:
+        return {}
+
+    aggregated: dict[str, list] = {}
+    layer_names = client_weights_list[0].keys()
+
+    for layer_name in layer_names:
+        stacked = torch.stack(
+            [torch.tensor(weights[layer_name], dtype=torch.float32) for weights in client_weights_list]
+        )
+        aggregated[layer_name] = stacked.mean(dim=0).tolist()
+
+    return aggregated
 
 
 async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float = 2.0) -> dict:
@@ -91,6 +109,7 @@ async def global_retrieve(drug_id: str) -> dict:
     completeness_score = f"{len(available_clients)}/{len(CLIENT_URLS)}"
 
     evidence_paths = []
+    client_weights_list = []
     for response in raw_responses:
         update_id = response.get("update_id")
         client_id = response.get("client_id", "unknown")
@@ -133,10 +152,16 @@ async def global_retrieve(drug_id: str) -> dict:
         )
 
         if response.get("status") == "success":
+            model_weights = response.get("model_weights")
+            if model_weights:
+                client_weights_list.append(model_weights)
+
             for target in response.get("targets", []):
                 evidence_paths.append(
                     {"client_id": client_id, "path": f"{drug_id} -> {target}"}
                 )
+
+    global_aggregated_model = aggregate_models(client_weights_list)
 
     return {
         "query": drug_id,
@@ -146,6 +171,7 @@ async def global_retrieve(drug_id: str) -> dict:
         "missing_clients": missing_clients,
         "evidence_paths_count": len(evidence_paths),
         "evidence_paths": evidence_paths,
+        "global_aggregated_model": global_aggregated_model,
         "raw_responses": raw_responses,
     }
 

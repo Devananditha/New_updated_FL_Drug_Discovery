@@ -4,6 +4,8 @@ import argparse
 import uuid
 
 import networkx as nx
+import torch
+import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
@@ -13,19 +15,55 @@ G = None
 CLIENT_NAME = "Unknown"
 
 
+class LinkPredictor(nn.Module):
+    """Lightweight MLP for simulated federated link prediction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(16, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def state_dict_to_lists(state_dict: dict) -> dict:
+    return {key: tensor.detach().cpu().tolist() for key, tensor in state_dict.items()}
+
+
+def train_local_model(drug_id: str) -> dict:
+    """Run a dummy 1-epoch local training loop and return serializable weights."""
+    seed = abs(hash(drug_id)) % (2**32)
+    torch.manual_seed(seed)
+
+    model = LinkPredictor()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.BCELoss()
+
+    features = torch.randn(32, 16)
+    labels = torch.randint(0, 2, (32, 1)).float()
+
+    model.train()
+    optimizer.zero_grad()
+    predictions = model(features)
+    loss = criterion(predictions, labels)
+    loss.backward()
+    optimizer.step()
+
+    return state_dict_to_lists(model.state_dict())
+
+
 @app.get("/retrieve")
 def retrieve(drug_id: str) -> dict:
-    """Return local graph neighbors for a queried drug ID.
-
-    Args:
-        drug_id: Drug or compound identifier present in the local graph partition.
-
-    Returns:
-        JSON payload with client metadata, matched targets, status, and a unique
-        ``update_id`` used by the coordinator for exactly-once ledger tracking.
-    """
+    """Return local graph neighbors for a queried drug ID."""
     if G is None:
         raise HTTPException(status_code=503, detail="Client graph is not loaded")
+
+    model_weights = train_local_model(drug_id)
 
     if drug_id not in G:
         payload = {
@@ -33,6 +71,7 @@ def retrieve(drug_id: str) -> dict:
             "drug_id": drug_id,
             "targets": [],
             "status": "not_found",
+            "model_weights": model_weights,
         }
         payload["update_id"] = str(uuid.uuid4())
         return payload
@@ -43,6 +82,7 @@ def retrieve(drug_id: str) -> dict:
         "drug_id": drug_id,
         "targets": targets,
         "status": "success",
+        "model_weights": model_weights,
     }
     payload["update_id"] = str(uuid.uuid4())
     return payload
