@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -244,6 +245,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         Federated retrieval payload containing query metadata, completeness score,
         available and missing clients, evidence paths, and raw client responses.
     """
+    query_start = time.perf_counter()
     query_id = str(uuid.uuid4())
     round_id = _next_round_id()
 
@@ -394,6 +396,13 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         verified_batch_hashes,
     )
 
+    total_latency_ms = round((time.perf_counter() - query_start) * 1000, 2)
+    system_state = (
+        "no_failure"
+        if len(available_clients) == len(CLIENT_URLS)
+        else "failure"
+    )
+
     return {
         "query": drug_id,
         "query_id": query_id,
@@ -410,6 +419,10 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         ),
         "global_aggregated_model": summarize_state_dict_lists(global_aggregated_model),
         "gas_optimization_metrics": gas_optimization_metrics,
+        "performance_metrics": {
+            "total_latency_ms": total_latency_ms,
+            "system_state": system_state,
+        },
         "raw_responses": sanitize_raw_responses_for_api(raw_responses),
     }
 
