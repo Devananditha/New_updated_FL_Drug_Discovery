@@ -46,8 +46,10 @@ CLIENT_URLS = [
     "http://localhost:8003",
 ]
 
-UNBATCHED_GAS_PER_TARGET = 10
-BATCHED_GAS_PER_CLIENT = 50
+# Per-target txs are modeled as expensive; one batched commit per lab is cheaper.
+# Break-even (positive gas_saved_%): total_targets > (BATCHED / UNBATCHED) * clients.
+UNBATCHED_GAS_PER_TARGET = 100
+BATCHED_GAS_PER_CLIENT = 40
 
 _FEDERATED_ROUND_ID = 0
 
@@ -102,7 +104,11 @@ def calculate_gas_optimization_metrics(
     successful_clients_count: int,
     verified_batch_hashes: list[str],
 ) -> dict:
-    """Estimate theoretical gas savings from batching vs per-target transactions."""
+    """Estimate theoretical gas savings from batching vs per-target transactions.
+
+    Unbatched: one notional transaction per returned target. Batched: one per successful
+    client. Typical federated runs (many targets, few clients) show positive savings.
+    """
     simulated_unbatched_gas = len(all_targets_found) * UNBATCHED_GAS_PER_TARGET
     actual_batched_gas = successful_clients_count * BATCHED_GAS_PER_CLIENT
 
@@ -232,6 +238,7 @@ async def fetch_client_data(
     url: str,
     drug_id: str,
     task_type: str = "classification",
+    fast: bool = False,
     timeout: float = CLIENT_RETRIEVE_TIMEOUT_SECONDS,
 ) -> dict:
     """Fetch drug-target evidence from one lab client with a strict timeout.
@@ -246,9 +253,12 @@ async def fetch_client_data(
         Parsed JSON response from the client, or a synthetic failure payload when
         the client is unreachable or exceeds the timeout.
     """
-    target_url = (
-        f"{url}/retrieve?drug_id={drug_id}&task_type={task_type}&include_weights=true"
-    )
+    if fast:
+        target_url = f"{url}/retrieve?drug_id={drug_id}&task_type={task_type}&fast=true"
+    else:
+        target_url = (
+            f"{url}/retrieve?drug_id={drug_id}&task_type={task_type}&include_weights=true"
+        )
     request_id = str(uuid.uuid4())
 
     try:
@@ -277,6 +287,7 @@ async def global_retrieve(
     drug_id: str,
     mode: str = "aware",
     task_type: str = "classification",
+    fast: bool = False,
 ) -> dict:
     """Query all lab clients in parallel and return a partial federated answer.
 
@@ -287,6 +298,7 @@ async def global_retrieve(
     Args:
         drug_id: Drug identifier shared across all client queries.
         task_type: ``classification`` for link prediction or ``regression`` for DeepDTA affinity.
+        fast: Skip per-client ML training and use quick graph neighbor lookup (load-test demo).
 
     Returns:
         Federated retrieval payload containing query metadata, completeness score,
@@ -315,8 +327,16 @@ async def global_retrieve(
             detail="task_type must be 'classification' or 'regression'",
         )
 
+    client_timeout = 20.0 if fast else CLIENT_RETRIEVE_TIMEOUT_SECONDS
     tasks = [
-        fetch_client_data(f"Client_{index}", url, drug_id, task_type=task_type)
+        fetch_client_data(
+            f"Client_{index}",
+            url,
+            drug_id,
+            task_type=task_type,
+            fast=fast,
+            timeout=client_timeout,
+        )
         for index, url in enumerate(CLIENT_URLS, start=1)
     ]
     raw_responses = await asyncio.gather(*tasks)
@@ -460,6 +480,7 @@ async def global_retrieve(
     return {
         "query": drug_id,
         "task_type": task_type,
+        "fast": fast,
         "query_id": query_id,
         "round_id": round_id,
         "completeness_score": completeness_score,

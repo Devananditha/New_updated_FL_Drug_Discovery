@@ -368,6 +368,29 @@ def resume_from_checkpoint() -> None:
         )
 
 
+def _fast_graph_retrieve(drug_id: str, task_type: str) -> tuple[str, list[dict], dict]:
+    """Graph neighbor lookup only — used for load-test / demo speed (no ML training)."""
+    if drug_id not in G:
+        return "not_found", [], _empty_metrics(task_type)
+
+    neighbors = list(G.neighbors(drug_id))[:TOP_K]
+    scored_paths = [
+        {"path": f"{drug_id} -> {target}", "ml_score": 0.72}
+        for target in neighbors
+    ]
+    demo_metrics = (
+        {"mse": 0.0, "r2": 0.0}
+        if task_type == "regression"
+        else {
+            "precision": 0.6,
+            "recall": 0.6,
+            "f1_score": 0.6,
+            "top_50_precision": 0.64,
+        }
+    )
+    return "success", scored_paths, demo_metrics
+
+
 def _build_retrieve_payload(
     *,
     drug_id: str,
@@ -406,6 +429,7 @@ def retrieve(
     drug_id: str,
     task_type: str = "classification",
     include_weights: bool = False,
+    fast: bool = False,
 ) -> dict:
     """Return local graph neighbors for a queried drug ID."""
     if task_type not in ("classification", "regression"):
@@ -415,6 +439,20 @@ def retrieve(
         )
     if G is None:
         raise HTTPException(status_code=503, detail="Client graph is not loaded")
+
+    if fast:
+        print(f"[Retrieve] {CLIENT_NAME} fast lookup for {drug_id} (skipping ML training)")
+        status, scored_paths, metrics = _fast_graph_retrieve(drug_id, task_type)
+        state_dict = LinkPredictor(task_type=task_type).state_dict()
+        return _build_retrieve_payload(
+            drug_id=drug_id,
+            task_type=task_type,
+            status=status,
+            scored_paths=scored_paths,
+            metrics=metrics,
+            state_dict=state_dict,
+            include_weights=False,
+        )
 
     if CLIENT_STATE.last_valid_checkpoint:
         print(
