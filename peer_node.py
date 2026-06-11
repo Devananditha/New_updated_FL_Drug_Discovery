@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import random
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -67,6 +68,17 @@ KNOWN_PEERS: dict[str, dict] = {}
 
 HEARTBEAT_INTERVAL_SECONDS = 10
 HEARTBEAT_TIMEOUT_SECONDS = 3
+
+# ---------------------------------------------------------------------------
+# CRDT Ledger — LWW-Map (Last-Writer-Wins)
+# Key   : update_id  (UUID string, globally unique per FL round event)
+# Value : {
+#     "status"    : str   (e.g. "update_committed"),
+#     "timestamp" : float (Unix epoch — used for LWW conflict resolution),
+#     "client_id" : str   (originating peer name)
+# }
+# ---------------------------------------------------------------------------
+CRDT_LEDGER: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +690,96 @@ def closest_peers(target_id: str, limit: int = 2) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CRDT helper functions
+# ---------------------------------------------------------------------------
+
+def merge_crdt_event(update_id: str, payload: dict) -> bool:
+    """Merge a remote event into the local CRDT ledger using LWW strategy.
+
+    Args:
+        update_id: Globally unique identifier for the FL round event.
+        payload:   Dict containing at minimum ``timestamp`` (float),
+                   ``status`` (str), and ``client_id`` (str).
+
+    Returns:
+        ``True``  if the event was newly added or overwrote a stale entry.
+        ``False`` if the existing entry is newer-or-equal (event rejected).
+    """
+    incoming_ts = payload.get("timestamp", 0.0)
+
+    if update_id not in CRDT_LEDGER:
+        CRDT_LEDGER[update_id] = payload
+        return True
+
+    # LWW: only overwrite when the incoming timestamp is strictly newer
+    if incoming_ts > CRDT_LEDGER[update_id].get("timestamp", 0.0):
+        CRDT_LEDGER[update_id] = payload
+        return True
+
+    return False  # stale or duplicate — reject
+
+
+def check_if_duplicate(update_id: str) -> bool:
+    """Return True if update_id is already committed in the local CRDT ledger."""
+    entry = CRDT_LEDGER.get(update_id)
+    if entry is None:
+        return False
+    return entry.get("status") == "update_committed"
+
+
+# ---------------------------------------------------------------------------
+# CRDT endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/crdt_sync")
+def crdt_sync(incoming_ledger: dict) -> dict:
+    """Merge an incoming CRDT ledger from a remote peer (gossip receiver).
+
+    Accepts a JSON dict mapping update_id -> event payload and applies
+    the LWW merge strategy to each entry.
+
+    Returns:
+        A summary of merged vs. ignored event counts.
+    """
+    merged = 0
+    ignored = 0
+
+    for update_id, payload in incoming_ledger.items():
+        if not isinstance(payload, dict):
+            ignored += 1
+            continue
+        if merge_crdt_event(update_id, payload):
+            merged += 1
+        else:
+            ignored += 1
+
+    print(
+        f"[CRDT] Sync received {len(incoming_ledger)} events: "
+        f"{merged} merged, {ignored} ignored. Ledger size: {len(CRDT_LEDGER)}"
+    )
+    return {
+        "result": "sync_complete",
+        "received": len(incoming_ledger),
+        "merged": merged,
+        "ignored": ignored,
+        "ledger_size": len(CRDT_LEDGER),
+    }
+
+
+@app.get("/crdt_state")
+def crdt_state() -> dict:
+    """Return the full local CRDT ledger for inspection or gossip seeding.
+
+    This replaces the old SQLite-backed /audit data view.
+    """
+    return {
+        "peer_id": PEER_NAME,
+        "ledger_size": len(CRDT_LEDGER),
+        "ledger": CRDT_LEDGER,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Retrieval endpoints
 # ---------------------------------------------------------------------------
 
@@ -714,6 +816,21 @@ def global_retrieve(
     local_confidence = float(local_response.get("local_confidence", 0.0))
     weights_summary = sanitized_local.get("model_weights_summary", {})
 
+    # ------------------------------------------------------------------
+    # CRDT commit: record this FL round event in the local ledger
+    # ------------------------------------------------------------------
+    update_id = local_response.get("update_id", str(uuid.uuid4()))
+    if check_if_duplicate(update_id):
+        print(f"[CRDT] Duplicate update_id detected: {update_id} — skipping re-commit")
+    else:
+        crdt_payload = {
+            "status": "update_committed",
+            "timestamp": time.time(),
+            "client_id": PEER_NAME,
+        }
+        merge_crdt_event(update_id, crdt_payload)
+        print(f"[CRDT] Committed update_id={update_id[:8]}... ledger_size={len(CRDT_LEDGER)}")
+
     return {
         "query": drug_id,
         "task_type": task_type,
@@ -732,6 +849,7 @@ def global_retrieve(
         "global_aggregated_model": weights_summary,
         "raw_responses": [sanitized_local],
         "routing_mode": "local_only",
+        "crdt_update_id": update_id,
         "note": "P2P DHT propagation not yet implemented; only initiator peer queried.",
     }
 
