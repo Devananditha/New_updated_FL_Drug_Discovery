@@ -82,18 +82,26 @@ HEARTBEAT_TIMEOUT_SECONDS = 3
 # ---------------------------------------------------------------------------
 CRDT_LEDGER: dict[str, dict] = {}
 
+# ---------------------------------------------------------------------------
+# Bootstrap peer — URL of an existing peer to contact on startup (optional)
+# ---------------------------------------------------------------------------
+BOOTSTRAP_PEER: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Background heartbeat
 # ---------------------------------------------------------------------------
 
 async def heartbeat_loop() -> None:
-    """Continuously ping every known peer every HEARTBEAT_INTERVAL_SECONDS seconds.
+    """Continuously ping every known peer and discover new peers via gossip.
 
-    Only logs state *changes* (online->offline or offline->online) to avoid
-    flooding the console during normal operation.
+    On each cycle:
+    - Pings every known peer to track online/offline status and capture node_id.
+    - For each active peer, also fetches its /peers routing table and merges
+      any newly discovered peers into local KNOWN_PEERS (gossip-based discovery).
     """
     print("[Heartbeat] Background task started.")
+    my_url = f"http://localhost:{PEER_PORT}"
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         if not KNOWN_PEERS:
@@ -118,10 +126,34 @@ async def heartbeat_loop() -> None:
                     if previous_status != "active":
                         nid_short = str(KNOWN_PEERS[url].get("node_id", ""))[:8] or "unknown"
                         print(f"[Heartbeat] [ONLINE] Peer back ONLINE: {url} (node_id_prefix={nid_short})")
+
+                    # Gossip-based peer discovery: pull routing table and merge new peers
+                    try:
+                        peers_resp = await client.get(
+                            f"{url}/peers",
+                            timeout=HEARTBEAT_TIMEOUT_SECONDS,
+                        )
+                        if peers_resp.status_code == 200:
+                            remote_peers: dict = peers_resp.json().get("peers", {})
+                            for remote_url, remote_info in remote_peers.items():
+                                remote_url = remote_url.rstrip("/")
+                                if remote_url == my_url:
+                                    continue  # Never add self
+                                if remote_url not in KNOWN_PEERS:
+                                    KNOWN_PEERS[remote_url] = {
+                                        "last_seen": remote_info.get("last_seen"),
+                                        "status": remote_info.get("status", "active"),
+                                        "node_id": remote_info.get("node_id"),
+                                    }
+                                    print(f"[Heartbeat] [DISCOVERY] New peer via gossip: {remote_url}")
+                    except Exception:
+                        pass  # Gossip failures are non-critical
+
                 except (httpx.TimeoutException, httpx.ConnectError, Exception):
                     KNOWN_PEERS[url]["status"] = "offline"
                     if previous_status != "offline":
                         print(f"[Heartbeat] [OFFLINE] Peer went OFFLINE: {url}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +163,55 @@ async def heartbeat_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle."""
+
+    # -----------------------------------------------------------------------
+    # Bootstrap: join the network via one known peer (if --bootstrap given)
+    # -----------------------------------------------------------------------
+    if BOOTSTRAP_PEER:
+        my_url = f"http://localhost:{PEER_PORT}"
+        print(f"[Bootstrap] Contacting bootstrap peer {BOOTSTRAP_PEER} ...")
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{BOOTSTRAP_PEER}/bootstrap",
+                    params={"peer_url": my_url},
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                routing_table: dict = resp.json().get("known_peers", {})
+                merged = 0
+
+                # Always register the bootstrap peer itself first
+                # (a node never puts itself in its own KNOWN_PEERS)
+                bootstrap_url = BOOTSTRAP_PEER.rstrip("/")
+                if bootstrap_url != my_url and bootstrap_url not in KNOWN_PEERS:
+                    KNOWN_PEERS[bootstrap_url] = {
+                        "last_seen": datetime.now(timezone.utc).isoformat(),
+                        "status": "active",
+                        "node_id": None,
+                    }
+                    merged += 1
+                    print(f"[Bootstrap] Registered bootstrap peer: {bootstrap_url}")
+
+                # Merge the rest of the returned routing table
+                for url, info in routing_table.items():
+                    url = url.rstrip("/")
+                    if url == my_url or url == bootstrap_url:
+                        continue  # Skip self and already-added bootstrap peer
+                    if url not in KNOWN_PEERS:
+                        KNOWN_PEERS[url] = {
+                            "last_seen": info.get("last_seen"),
+                            "status": info.get("status", "active"),
+                            "node_id": info.get("node_id"),
+                        }
+                        merged += 1
+                print(
+                    f"[Bootstrap] Merged {merged} peers from {BOOTSTRAP_PEER}. "
+                    f"Total known: {len(KNOWN_PEERS)}"
+                )
+        except Exception as exc:
+            print(f"[Bootstrap] WARNING: Could not contact {BOOTSTRAP_PEER}: {exc}")
+
     task = asyncio.create_task(heartbeat_loop())
     print("[Lifespan] Heartbeat task created.")
     try:
@@ -690,6 +771,47 @@ def list_peers() -> dict:
     }
 
 
+@app.post("/bootstrap")
+def bootstrap(peer_url: str) -> dict:
+    """Network-entry endpoint: register a new peer and share this node's routing table.
+
+    A new peer contacts exactly one existing peer via this endpoint.  The
+    existing peer:
+    1. Registers the newcomer in its own KNOWN_PEERS (Step A).
+    2. Returns its full routing table to the newcomer so it can discover
+       the rest of the network (Step B).
+
+    Args:
+        peer_url: Base URL of the newcomer, e.g. ``http://localhost:8003``.
+    """
+    peer_url = peer_url.rstrip("/")
+    my_url = f"http://localhost:{PEER_PORT}"
+
+    # Step A: Register the newcomer if not already known
+    if peer_url == my_url:
+        return {"result": "self", "known_peers": KNOWN_PEERS}
+
+    if peer_url not in KNOWN_PEERS:
+        KNOWN_PEERS[peer_url] = {
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+            "status": "active",
+            "node_id": None,  # Heartbeat will resolve this
+        }
+        print(f"[Bootstrap] [+] New peer joined: {peer_url} (total known: {len(KNOWN_PEERS)})")
+    else:
+        # Refresh last_seen and ensure active
+        KNOWN_PEERS[peer_url]["last_seen"] = datetime.now(timezone.utc).isoformat()
+        KNOWN_PEERS[peer_url]["status"] = "active"
+        print(f"[Bootstrap] [~] Existing peer re-joined: {peer_url}")
+
+    # Step B: Return full routing table to the newcomer
+    return {
+        "result": "welcome",
+        "introducer": PEER_NAME,
+        "known_peers": KNOWN_PEERS,
+    }
+
+
 # ---------------------------------------------------------------------------
 # DHT Routing — XOR distance math & closest-peer lookup
 # ---------------------------------------------------------------------------
@@ -1067,8 +1189,9 @@ async def global_retrieve(
         if resp.get("peer_id") == PEER_NAME:
             local_update_id = resp.get("update_id")
 
-    # Completeness: how many peers responded vs total known peers (self + KNOWN_PEERS)
-    total_network_size = 1 + len(KNOWN_PEERS)  # self + known
+    # Completeness: how many peers responded vs total ACTIVE known peers (self + active)
+    active_known = sum(1 for info in KNOWN_PEERS.values() if info.get("status") == "active")
+    total_network_size = 1 + active_known  # self + active known peers
     completeness_score = f"{len(available_peers)}/{total_network_size}"
 
     # -----------------------------------------------------------------------
@@ -1142,10 +1265,19 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--file", type=str, required=True)
     parser.add_argument("--name", type=str, default="Peer_1")
+    parser.add_argument(
+        "--bootstrap",
+        type=str,
+        default=None,
+        help="URL of an existing peer to bootstrap from (e.g. http://localhost:8001)",
+    )
     args = parser.parse_args()
 
     PEER_NAME = args.name
     PEER_PORT = args.port
+    if args.bootstrap:
+        BOOTSTRAP_PEER = args.bootstrap.rstrip("/")
+        print(f"[Bootstrap] Will join network via {BOOTSTRAP_PEER}")
 
     # Generate stable DHT node ID from peer identity
     NODE_ID, NODE_ID_HEX = _generate_node_id(PEER_NAME, args.port)
