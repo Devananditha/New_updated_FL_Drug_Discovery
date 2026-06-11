@@ -1,5 +1,10 @@
-"""Compare failure-aware federation against a failure-unaware baseline."""
+"""Compare failure-aware federation against a failure-unaware baseline.
 
+Default: ``fast=true`` on every query (graph lookup only, no ML training) so the
+demo finishes quickly and isolates unaware vs aware failure handling.
+"""
+
+import argparse
 import random
 import subprocess
 import sys
@@ -37,6 +42,10 @@ DRUG_IDS = [
 TOTAL_REQUESTS_PER_MODE = 20
 FAULT_RATE = 0.35
 PRE_QUERY_FAILURE_SETTLE_SECONDS = 0.25
+COORDINATOR_TIMEOUT_FAST_SECONDS = 45.0
+COORDINATOR_TIMEOUT_FULL_SECONDS = 120.0
+CLIENT_RESTART_WAIT_SECONDS = 12.0
+POST_RESTART_SETTLE_SECONDS = 1.0
 
 
 def find_pid_by_port(port: int) -> int | None:
@@ -51,7 +60,7 @@ def find_pid_by_port(port: int) -> int | None:
     return None
 
 
-def wait_for_port(port: int, timeout: float = 8.0) -> bool:
+def wait_for_port(port: int, timeout: float = CLIENT_RESTART_WAIT_SECONDS) -> bool:
     """Wait until a process starts listening on the given local port."""
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
@@ -106,12 +115,17 @@ def kill_client_2() -> bool:
         return False
 
 
-def query_coordinator(mode: str, drug_id: str) -> tuple[int, dict]:
+def query_coordinator(mode: str, drug_id: str, *, fast: bool) -> tuple[int, dict]:
     """Send one federated retrieval request and return HTTP status plus payload."""
+    timeout = COORDINATOR_TIMEOUT_FAST_SECONDS if fast else COORDINATOR_TIMEOUT_FULL_SECONDS
+    params: dict[str, str] = {"drug_id": drug_id, "mode": mode}
+    if fast:
+        params["fast"] = "true"
+
     response = requests.get(
         COORDINATOR_URL,
-        params={"drug_id": drug_id, "mode": mode},
-        timeout=12,
+        params=params,
+        timeout=timeout,
     )
 
     try:
@@ -130,7 +144,12 @@ def build_experiment_plan(total_requests: int) -> list[tuple[str, bool]]:
     ]
 
 
-def run_mode_experiment(mode: str, experiment_plan: list[tuple[str, bool]]) -> dict[str, int]:
+def run_mode_experiment(
+    mode: str,
+    experiment_plan: list[tuple[str, bool]],
+    *,
+    fast: bool,
+) -> dict[str, int]:
     """Run one baseline mode under controlled Client 2 failures."""
     metrics = {
         "full_success": 0,
@@ -138,31 +157,47 @@ def run_mode_experiment(mode: str, experiment_plan: list[tuple[str, bool]]) -> d
         "failed_stalled": 0,
     }
 
-    print(f"\n=== Running {mode.upper()} baseline ({len(experiment_plan)} queries) ===")
+    ml_label = "fast (no ML)" if fast else "full ML"
+    print(f"\n=== Running {mode.upper()} baseline ({len(experiment_plan)} queries, {ml_label}) ===")
+    if mode == "unaware":
+        print(
+            "[note] unaware mode returns HTTP 500 when any client is down during the query "
+            "(expected on chaos queries; not 3/3)."
+        )
+
     for query_number, (drug_id, inject_fault) in enumerate(experiment_plan, start=1):
         if inject_fault:
-            # Keep Client 2 down during the request so the query observes the failure.
+            # Client 2 stays down until after this query completes.
             kill_client_2()
             time.sleep(PRE_QUERY_FAILURE_SETTLE_SECONDS)
+            chaos_note = " | chaos=Client_2_down"
         else:
             restart_client_2()
+            if POST_RESTART_SETTLE_SECONDS > 0:
+                time.sleep(POST_RESTART_SETTLE_SECONDS)
+            chaos_note = ""
 
         status_code = 0
         payload = {}
         try:
-            status_code, payload = query_coordinator(mode, drug_id)
+            status_code, payload = query_coordinator(mode, drug_id, fast=fast)
         except requests.RequestException as exc:
             metrics["failed_stalled"] += 1
             print(
                 f"[{mode} query {query_number:02d}] request_failed | "
-                f"drug_id={drug_id} | error={exc}"
+                f"drug_id={drug_id}{chaos_note} | error={exc}"
             )
-            continue
-        finally:
             if inject_fault:
                 restart_client_2()
+                if POST_RESTART_SETTLE_SECONDS > 0:
+                    time.sleep(POST_RESTART_SETTLE_SECONDS)
+            continue
 
-        completeness_score = payload.get("completeness_score", "0/3")
+        if status_code == 500:
+            completeness_score = "n/a (stalled)"
+        else:
+            completeness_score = payload.get("completeness_score", "0/3")
+
         if status_code == 200:
             if completeness_score == "3/3":
                 metrics["full_success"] += 1
@@ -175,8 +210,13 @@ def run_mode_experiment(mode: str, experiment_plan: list[tuple[str, bool]]) -> d
 
         print(
             f"[{mode} query {query_number:02d}] HTTP {status_code} | "
-            f"drug_id={drug_id} | completeness={completeness_score}"
+            f"drug_id={drug_id} | completeness={completeness_score}{chaos_note}"
         )
+
+        if inject_fault:
+            restart_client_2()
+            if POST_RESTART_SETTLE_SECONDS > 0:
+                time.sleep(POST_RESTART_SETTLE_SECONDS)
 
     restart_client_2()
     return metrics
@@ -263,9 +303,23 @@ def print_summary(unaware_metrics: dict[str, int], aware_metrics: dict[str, int]
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Compare failure-unaware vs failure-aware federation under Client 2 chaos."
+    )
+    parser.add_argument(
+        "--full-ml",
+        action="store_true",
+        help="Run full ML training per query (slow). Default is fast graph-only mode.",
+    )
+    args = parser.parse_args()
+    use_fast = not args.full_ml
+
+    if use_fast:
+        print("[load-test] Using fast=true — no ML training; graph neighbor lookup only.")
+
     random.seed(42)
     shared_experiment_plan = build_experiment_plan(TOTAL_REQUESTS_PER_MODE)
-    unaware_results = run_mode_experiment("unaware", shared_experiment_plan)
-    aware_results = run_mode_experiment("aware", shared_experiment_plan)
+    unaware_results = run_mode_experiment("unaware", shared_experiment_plan, fast=use_fast)
+    aware_results = run_mode_experiment("aware", shared_experiment_plan, fast=use_fast)
     print_summary(unaware_results, aware_results)
     create_comparison_chart(unaware_results, aware_results)
