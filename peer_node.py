@@ -89,6 +89,22 @@ BOOTSTRAP_PEER: str | None = None
 
 
 # ---------------------------------------------------------------------------
+# Peer churn helper
+# ---------------------------------------------------------------------------
+
+def mark_peer_offline(peer_url: str) -> None:
+    """Immediately mark a peer as offline after a network failure.
+
+    Called both by the heartbeat loop on ping failure and by the DHT routing
+    layer when a forwarded request fails mid-query.
+    """
+    info = KNOWN_PEERS.get(peer_url)
+    if info and info.get("status") == "active":
+        KNOWN_PEERS[peer_url]["status"] = "offline"
+        print(f"[Fault Tolerance] Peer {peer_url} marked OFFLINE due to network error.")
+
+
+# ---------------------------------------------------------------------------
 # Background heartbeat
 # ---------------------------------------------------------------------------
 
@@ -150,7 +166,7 @@ async def heartbeat_loop() -> None:
                         pass  # Gossip failures are non-critical
 
                 except (httpx.TimeoutException, httpx.ConnectError, Exception):
-                    KNOWN_PEERS[url]["status"] = "offline"
+                    mark_peer_offline(url)
                     if previous_status != "offline":
                         print(f"[Heartbeat] [OFFLINE] Peer went OFFLINE: {url}")
 
@@ -1125,8 +1141,10 @@ async def dht_retrieve_internal(
         # Filter out already visited peers
         to_forward = [c for c in candidates if c["url"] not in updated_visited]
 
-        # Pick top 2 closest remaining peers
+        # Pick top 2 closest remaining peers as initial targets
         targets = to_forward[:2]
+        # Keep the rest as fallbacks (index 2 onwards) for fault tolerance
+        fallback_pool = list(to_forward[2:])
 
         if targets:
             print(f"[DHT] {PEER_NAME} forwarding query {query_id[:8]} to: {[t['url'] for t in targets]} (ttl={ttl})")
@@ -1137,7 +1155,8 @@ async def dht_retrieve_internal(
                 if t["url"] not in next_visited:
                     next_visited.append(t["url"])
 
-            async def forward_to_peer(peer_url: str):
+            async def forward_to_peer(peer_url: str) -> list | dict:
+                """Forward DHT query to a single peer; mark it offline on failure."""
                 try:
                     async with httpx.AsyncClient() as client:
                         response = await client.post(
@@ -1155,16 +1174,46 @@ async def dht_retrieve_internal(
                             return response.json()
                         else:
                             print(f"[DHT] Failed to query {peer_url}, status code: {response.status_code}")
-                            return []
+                            mark_peer_offline(peer_url)
+                            return {"status": "failed", "url": peer_url}
                 except Exception as e:
-                    print(f"[DHT] Error querying {peer_url}: {e}")
-                    return []
+                    print(f"[DHT] Error querying {peer_url}: {type(e).__name__}")
+                    mark_peer_offline(peer_url)
+                    return {"status": "failed", "url": peer_url}
 
             tasks = [forward_to_peer(t["url"]) for t in targets]
-            gathered = await asyncio.gather(*tasks)
-            for g in gathered:
-                if isinstance(g, list):
-                    forward_results.extend(g)
+            gathered = list(await asyncio.gather(*tasks))
+
+            # --- Dynamic Routing Fallback -----------------------------------
+            # For every target that failed, try the next closest peer in the
+            # fallback pool until we either succeed or run out of candidates.
+            final_results = []
+            for result in gathered:
+                if isinstance(result, dict) and result.get("status") == "failed":
+                    # This target failed — try fallback peers one by one
+                    recovered = False
+                    while fallback_pool:
+                        fallback = fallback_pool.pop(0)
+                        fallback_url = fallback["url"]
+                        if fallback_url in next_visited:
+                            continue
+                        print(
+                            f"[Fault Tolerance] Falling back to {fallback_url} "
+                            f"after failure in query {query_id[:8]}"
+                        )
+                        next_visited.append(fallback_url)
+                        fallback_result = await forward_to_peer(fallback_url)
+                        if isinstance(fallback_result, list):
+                            final_results.extend(fallback_result)
+                            recovered = True
+                            break
+                        # fallback also failed — loop continues to next candidate
+                    if not recovered:
+                        print(f"[Fault Tolerance] No fallback peers left for query {query_id[:8]}.")
+                elif isinstance(result, list):
+                    final_results.extend(result)
+
+            forward_results.extend(final_results)
 
     # Step C (Bubble Up)
     return [local_response] + forward_results
@@ -1203,6 +1252,16 @@ async def global_retrieve(
         ttl=ttl,
         visited_peers=[]
     )
+    # Deduplicate responses by peer_id — fallback routing can cause the same
+    # peer to respond via two different paths; keep the first occurrence only.
+    seen_peer_ids: set = set()
+    deduped: list[dict] = []
+    for resp in raw_responses:
+        pid = resp.get("peer_id", "unknown")
+        if pid not in seen_peer_ids:
+            seen_peer_ids.add(pid)
+            deduped.append(resp)
+    raw_responses = deduped
 
     # -----------------------------------------------------------------------
     # Step 2: Collect inputs from raw responses
