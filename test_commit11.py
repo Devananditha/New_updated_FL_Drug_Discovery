@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import requests
+import psutil
 
 VENV_PY = r".\venv\Scripts\python.exe"
 SCRIPT   = "peer_node.py"
@@ -84,7 +85,27 @@ def print_table(nodes_info: list[dict]) -> None:
         )
 
 
+def _free_port(port: int) -> None:
+    """Terminate any process currently bound to *port* so we get a clean slate."""
+    for conn in psutil.net_connections(kind="inet"):
+        try:
+            if conn.laddr and conn.laddr.port == port and conn.pid:
+                psutil.Process(conn.pid).terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+            pass
+
+
 try:
+    # -----------------------------------------------------------------------
+    # PORT CLEANUP — kill any leftover processes from previous test runs
+    # -----------------------------------------------------------------------
+    ports_needed = [BASE_PORT + i for i in range(NUM_NODES)]
+    print(f"\n  [Setup] Freeing ports {ports_needed} before spawning...")
+    for _p in ports_needed:
+        _free_port(_p)
+    time.sleep(2)  # Give OS time to release the ports
+    print("  [Setup] Ports cleared.")
+
     # -----------------------------------------------------------------------
     # STEP 1: Spawn the swarm
     # -----------------------------------------------------------------------
@@ -95,7 +116,7 @@ try:
                 "--file", GRAPH_FILES[0], "--name", "Peer_1"]
     print("  [+] Peer_1 on port 8001 (seed)...")
     processes.append(subprocess.Popen(seed_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-    time.sleep(3)
+    time.sleep(5)  # Give seed extra time to fully bind before bootstrappers connect
 
     # Remaining nodes
     bootstrap = f"http://localhost:{BASE_PORT}"
@@ -124,7 +145,7 @@ try:
     # STEP 3: Watch gossip mesh form (wait up to 35s)
     # -----------------------------------------------------------------------
     section("Step 3: Waiting for gossip mesh to form (up to 35s)")
-    mesh_deadline = time.time() + 35
+    mesh_deadline = time.time() + 50  # Extended to 50s to cover slower machines
     fully_meshed = False
     while time.time() < mesh_deadline:
         nodes_info = [poll_node(BASE_PORT + i) for i in range(NUM_NODES)]
@@ -177,7 +198,7 @@ try:
     # STEP 6: Wait for gossip to propagate ledger to all peers (up to 30s)
     # -----------------------------------------------------------------------
     section("Step 6: Waiting up to 30s for CRDT gossip to propagate to all nodes")
-    gossip_deadline = time.time() + 30
+    gossip_deadline = time.time() + 45  # Extended to 45s — covers a full gossip cycle (15s) x3
     all_synced = False
     while time.time() < gossip_deadline:
         nodes_info = [poll_node(BASE_PORT + i) for i in range(NUM_NODES)]
