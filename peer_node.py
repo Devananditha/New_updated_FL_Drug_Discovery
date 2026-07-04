@@ -600,8 +600,15 @@ def _build_local_payload(
     metrics: dict,
     state_dict: dict,
     include_weights: bool,
+    training_edge_count: int = 0,
 ) -> dict:
-    """Assemble the local peer retrieval response."""
+    """Assemble the local peer retrieval response.
+
+    Args:
+        training_edge_count: Number of positive edges actually used during
+            local training. Sent in the response payload so the FedAvg
+            initiator can perform edge-count-weighted aggregation.
+    """
     response_id = str(uuid.uuid4())
     payload = {
         "peer_id": PEER_NAME,
@@ -617,6 +624,8 @@ def _build_local_payload(
         "checkpoint_path": peer_checkpoint_path(),
         "model_version": MODEL_VERSION,
         "update_id": str(uuid.uuid4()),
+        # Edge-count-weighted FedAvg: report local training set size
+        "training_edge_count": training_edge_count,
     }
     if include_weights:
         payload["model_weights"] = state_dict_to_lists(state_dict)
@@ -644,6 +653,10 @@ def run_local_retrieve(
     state_dict = local_model.state_dict()
     print(f"[Local Retrieve] {PEER_NAME} training complete for {drug_id}")
 
+    # Report actual positive-edge count used for training (bounded by POSITIVE_TRAIN_EDGES)
+    all_edges = list(G.edges()) if G is not None else []
+    training_edge_count = min(len(all_edges), POSITIVE_TRAIN_EDGES)
+
     if drug_id not in G:
         return _build_local_payload(
             drug_id=drug_id,
@@ -653,6 +666,7 @@ def run_local_retrieve(
             metrics=metrics,
             state_dict=state_dict,
             include_weights=include_weights,
+            training_edge_count=training_edge_count,
         )
 
     targets = list(G.neighbors(drug_id))
@@ -665,6 +679,7 @@ def run_local_retrieve(
         metrics=metrics,
         state_dict=state_dict,
         include_weights=include_weights,
+        training_edge_count=training_edge_count,
     )
 
 
@@ -718,56 +733,88 @@ def sanitize_peer_response_for_api(response: dict) -> dict:
 # FedAvg aggregation helpers
 # ---------------------------------------------------------------------------
 
-def aggregate_models(client_weights_list: list[dict]) -> dict:
-    """Federated Averaging (FedAvg) over a list of serialized PyTorch state dicts.
+def aggregate_models(
+    client_weights_list: list[dict],
+    edge_counts: list[int] | None = None,
+) -> dict:
+    """Weighted Federated Averaging over serialized PyTorch state dicts.
 
-    Each value in the state dict is a plain Python list (tensor serialized via
-    ``state_dict_to_lists``).  We perform an element-wise mean across all peers
-    and return the averaged state dict in the same list format.
+    Performs edge-count-weighted FedAvg when ``edge_counts`` are provided:
+    each peer's contribution is proportional to its local training-set size,
+    giving peers with more biomedical interaction evidence a higher influence
+    on the global model.  Falls back to uniform (unweighted) averaging when
+    counts are absent or all-zero.
 
     Args:
         client_weights_list: List of state dicts, each mapping layer name to a
-                             nested list of floats.
+                             nested list of floats (from ``state_dict_to_lists``).
+        edge_counts:         Parallel list of positive training-edge counts, one
+                             per entry in ``client_weights_list``. If None or
+                             all zeros, unweighted averaging is used.
 
     Returns:
-        Averaged state dict (same structure), or empty dict if input is empty.
+        Weighted-averaged state dict (same structure), or empty dict if input
+        is empty.
     """
     if not client_weights_list:
         return {}
+
+    n = len(client_weights_list)
+
+    # -----------------------------------------------------------------------
+    # Compute normalised per-peer weights w_k = edge_count_k / sum(edge_counts)
+    # Fall back to uniform 1/n if counts are missing or degenerate.
+    # -----------------------------------------------------------------------
+    if edge_counts and len(edge_counts) == n and sum(edge_counts) > 0:
+        total = sum(edge_counts)
+        peer_weights = [c / total for c in edge_counts]
+        aggregation_mode = "weighted"
+    else:
+        peer_weights = [1.0 / n] * n
+        aggregation_mode = "uniform"
+
+    print(f"[FedAvg] Aggregation mode: {aggregation_mode} | peer weights: "
+          f"{[round(w, 4) for w in peer_weights]}")
 
     # Use first client's keys as reference
     reference = client_weights_list[0]
     aggregated: dict = {}
 
     for layer_name, ref_tensor in reference.items():
-        # Collect the same layer from every peer
-        all_tensors = []
-        for weights in client_weights_list:
+        # Collect the same layer from every peer; skip peers missing the layer
+        peer_tensors: list = []
+        active_weights: list[float] = []
+        for p, weights in enumerate(client_weights_list):
             t = weights.get(layer_name)
             if t is not None:
-                all_tensors.append(t)
+                peer_tensors.append(t)
+                active_weights.append(peer_weights[p])
 
-        if not all_tensors:
+        if not peer_tensors:
             aggregated[layer_name] = ref_tensor
             continue
 
-        n = len(all_tensors)
+        # Re-normalise weights for the peers that actually provided this layer
+        weight_sum = sum(active_weights)
+        norm_weights = [w / weight_sum for w in active_weights]
 
-        # 2-D tensor (e.g. embedding or linear weight matrix)
+        # 2-D tensor (embedding matrix or linear weight matrix)
         if isinstance(ref_tensor[0], list):
             rows = len(ref_tensor)
             cols = len(ref_tensor[0])
             avg = [
                 [
-                    sum(all_tensors[p][r][c] for p in range(n)) / n
+                    sum(norm_weights[p] * peer_tensors[p][r][c]
+                        for p in range(len(peer_tensors)))
                     for c in range(cols)
                 ]
                 for r in range(rows)
             ]
         else:
-            # 1-D tensor (bias / output layer)
+            # 1-D tensor (bias vector)
             avg = [
-                sum(all_tensors[p][i] for p in range(n)) / n
+                sum(norm_weights[p] * peer_tensors[p][i]
+                    for p in range(len(peer_tensors)))
                 for i in range(len(ref_tensor))
             ]
 
@@ -1368,6 +1415,7 @@ async def global_retrieve(
     # Step 2: Collect inputs from raw responses
     # -----------------------------------------------------------------------
     client_weights_list: list[dict] = []
+    peer_edge_counts: list[int] = []      # for weighted FedAvg
     peer_metrics: dict = {}
     evidence_paths: list = []
     available_peers: list = []
@@ -1384,10 +1432,11 @@ async def global_retrieve(
         else:
             missing_peers.append(p_id)
 
-        # Collect model weights for FedAvg
+        # Collect model weights and training-edge counts for weighted FedAvg
         weights = resp.get("model_weights")
         if weights:
             client_weights_list.append(weights)
+            peer_edge_counts.append(int(resp.get("training_edge_count", 0)))
 
         # Collect per-peer metrics
         m = resp.get("metrics")
@@ -1412,9 +1461,9 @@ async def global_retrieve(
     completeness_score = f"{len(available_peers)}/{total_network_size}"
 
     # -----------------------------------------------------------------------
-    # Step 3: FedAvg — element-wise average of all collected weights
+    # Step 3: Weighted FedAvg — edge-count-proportional averaging
     # -----------------------------------------------------------------------
-    fedavg_weights = aggregate_models(client_weights_list)
+    fedavg_weights = aggregate_models(client_weights_list, edge_counts=peer_edge_counts)
     global_aggregated_model = summarize_state_dict_lists(fedavg_weights)
     print(
         f"[FedAvg] Aggregated {len(client_weights_list)} weight sets. "
